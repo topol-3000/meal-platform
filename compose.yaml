@@ -1,0 +1,205 @@
+# FamilyMeal local platform.
+#   make up        core: Postgres, Redis, Grafana LGTM (+ profiles from COMPOSE_PROFILES in .env)
+#   Profiles:  ai        -> Ollama
+#              langfuse  -> Langfuse (web, worker, ClickHouse, MinIO, Redis)
+# All containers share the `meal-platform` network so services started from their own
+# repos (`make docker-run`) can reach `postgres`, `redis`, `lgtm`, `ollama` by name.
+
+name: meal-platform
+
+networks:
+  default:
+    name: meal-platform
+
+x-healthcheck: &healthcheck
+  interval: 5s
+  timeout: 5s
+  retries: 20
+
+services:
+  # ---------------------------------------------------------------- core ----
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      # One database and one owner role per service (DB per service).
+      SERVICE_DATABASES: ${SERVICE_DATABASES:-recipes,planner,shopping,langfuse}
+      TZ: UTC
+      PGTZ: UTC
+    ports:
+      - 127.0.0.1:5432:5432
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+
+  redis:
+    # Event bus (Redis Streams) and cache. Streams must never be evicted.
+    image: redis:8
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    ports:
+      - 127.0.0.1:6379:6379
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "redis-cli", "ping"]
+
+  lgtm:
+    # Grafana + OTel Collector + Tempo (traces) + Loki (logs) + Prometheus (metrics)
+    # + Pyroscope (profiles), preconfigured. Dev/test only.
+    image: grafana/otel-lgtm:0.38.0
+    restart: unless-stopped
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    ports:
+      - 127.0.0.1:3000:3000 # Grafana UI
+      - 127.0.0.1:4317:4317 # OTLP gRPC
+      - 127.0.0.1:4318:4318 # OTLP HTTP
+    volumes:
+      - lgtm_data:/data
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000/api/health && curl -so /dev/null http://localhost:4318/"]
+      start_period: 30s
+
+  # ----------------------------------------------------------- profile: ai ----
+  ollama:
+    image: ollama/ollama:0.40.11
+    profiles: [ai]
+    restart: unless-stopped
+    environment:
+      OLLAMA_KEEP_ALIVE: 30m
+      OLLAMA_CONTEXT_LENGTH: ${OLLAMA_CONTEXT_LENGTH:-8192}
+    ports:
+      - 127.0.0.1:11434:11434
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "ollama", "list"]
+
+  # ----------------------------------------------------- profile: langfuse ----
+  # Mirrors upstream https://github.com/langfuse/langfuse/blob/main/docker-compose.yml
+  # but reuses our Postgres and listens on :3001 (Grafana has :3000).
+  langfuse-worker:
+    image: langfuse/langfuse-worker:4
+    profiles: [langfuse]
+    restart: unless-stopped
+    depends_on: &langfuse-depends-on
+      postgres: { condition: service_healthy }
+      langfuse-minio: { condition: service_healthy }
+      langfuse-redis: { condition: service_healthy }
+      langfuse-clickhouse: { condition: service_healthy }
+    environment: &langfuse-env
+      NEXTAUTH_URL: http://localhost:3001
+      DATABASE_URL: postgresql://langfuse:langfuse@postgres:5432/langfuse # role from postgres/init
+      SALT: ${LANGFUSE_SALT:-local-dev-salt}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
+      TELEMETRY_ENABLED: "false"
+      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-clickhouse}
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_PASSWORD:-miniosecret}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_PASSWORD:-miniosecret}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+      REDIS_HOST: langfuse-redis
+      REDIS_PORT: "6379"
+      REDIS_AUTH: ${LANGFUSE_REDIS_PASSWORD:-langfuseredis}
+
+  langfuse-web:
+    image: langfuse/langfuse:4
+    profiles: [langfuse]
+    restart: unless-stopped
+    depends_on: *langfuse-depends-on
+    ports:
+      - 127.0.0.1:3001:3000
+    environment:
+      <<: *langfuse-env
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-local-dev-secret}
+      # Browser-facing media uploads go through the host port.
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://localhost:9090
+      LANGFUSE_S3_MEDIA_UPLOAD_INTERNAL_ENDPOINT: http://langfuse-minio:9000
+      # Headless init: org, project, API keys and a login, so services can send traces at once.
+      LANGFUSE_INIT_ORG_ID: familymeal
+      LANGFUSE_INIT_ORG_NAME: FamilyMeal
+      LANGFUSE_INIT_PROJECT_ID: familymeal
+      LANGFUSE_INIT_PROJECT_NAME: FamilyMeal
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-local}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-local}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_USER_EMAIL:-admin@familymeal.local}
+      LANGFUSE_INIT_USER_NAME: admin
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_USER_PASSWORD:-familymeal}
+
+  langfuse-clickhouse:
+    image: clickhouse/clickhouse-server:25.12
+    profiles: [langfuse]
+    restart: unless-stopped
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-clickhouse}
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    healthcheck:
+      <<: *healthcheck
+      test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
+
+  langfuse-minio:
+    image: cgr.dev/chainguard/minio
+    profiles: [langfuse]
+    restart: unless-stopped
+    entrypoint: sh
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: ${LANGFUSE_MINIO_PASSWORD:-miniosecret}
+    ports:
+      - 127.0.0.1:9090:9000
+    volumes:
+      - langfuse_minio_data:/data
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "mc", "ready", "local"]
+
+  langfuse-redis:
+    image: redis:8
+    profiles: [langfuse]
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${LANGFUSE_REDIS_PASSWORD:-langfuseredis}", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - langfuse_redis_data:/data
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "redis-cli", "-a", "${LANGFUSE_REDIS_PASSWORD:-langfuseredis}", "ping"]
+
+volumes:
+  postgres_data:
+  redis_data:
+  lgtm_data:
+  ollama_data:
+  langfuse_clickhouse_data:
+  langfuse_clickhouse_logs:
+  langfuse_minio_data:
+  langfuse_redis_data:

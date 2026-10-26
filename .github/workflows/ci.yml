@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compose files and JSON schemas are valid
+        run: make lint
+      - name: Shell scripts
+        run: shellcheck scripts/*.sh postgres/init/*.sh
+
+  core-stack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Start core services (no GPU, no optional profiles)
+        run: |
+          cp .env.example .env
+          sed -i 's/^COMPOSE_PROFILES=.*/COMPOSE_PROFILES=/; s/^COMPOSE_FILE=.*/COMPOSE_FILE=compose.yaml/' .env
+          docker compose up -d --wait
+      - name: Service databases exist
+        run: |
+          for db in recipes planner shopping langfuse; do
+            docker compose exec -T postgres psql -U "$db" -d "$db" -c 'select 1' > /dev/null
+          done
+      - if: failure()
+        run: docker compose logs
