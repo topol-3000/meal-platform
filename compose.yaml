@@ -1,0 +1,59 @@
+# FamilyMeal local platform: `make up` / `make down` (see README.md).
+# Ports are published on 127.0.0.1 only: nothing here has real credentials.
+# Services generated from meal-service-template expect these names, ports and images;
+# change them together with the template (POSTGRES_IMAGE / VALKEY_IMAGE in tests/conftest.py).
+name: meal-platform
+
+services:
+  # Grafana with Tempo, Loki and Prometheus (datasource uids `tempo`, `loki`, `prometheus`)
+  # behind an OpenTelemetry Collector. Telemetry is not persisted: `make down` clears it.
+  lgtm:
+    image: grafana/otel-lgtm:0.38.1
+    ports:
+      - "127.0.0.1:3000:3000" # Grafana
+      - "127.0.0.1:4317:4317" # OTLP gRPC
+      - "127.0.0.1:4318:4318" # OTLP HTTP
+    healthcheck:
+      # The image's own check, polled every 2 s while starting so `make up` returns sooner.
+      test: ["CMD", "/otel-lgtm/docker/healthcheck.sh"]
+      interval: 30s
+      start_period: 120s
+      start_interval: 2s
+
+  # One server for every service, a database and a user per service (`make db-add`).
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      # PostgreSQL 18 images keep data in /var/lib/postgresql/18/docker.
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "postgres"]
+      interval: 10s
+      start_period: 30s
+      start_interval: 1s
+
+  # Cache for services rendered with `with_cache`. Not persisted: a cache may start empty.
+  valkey:
+    image: valkey/valkey:9
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      start_period: 30s
+      start_interval: 1s
+
+  # Services join here (docs/adding-a-service.md), each with a `<service>-migrate` job.
+
+networks:
+  default:
+    # A fixed name, so `docker run --network meal-platform` reaches `lgtm`, `postgres`, `valkey`.
+    name: meal-platform
+
+volumes:
+  postgres-data:
