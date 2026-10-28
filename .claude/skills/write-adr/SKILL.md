@@ -5,7 +5,7 @@ description: Write an Architecture Decision Record in docs/adr. Use when a decis
 
 # Write an ADR
 
-1. Find the next number: `ls docs/adr | sort | tail -1`.
+1. Find the next number: `ls docs/adr/[0-9]*.md | tail -1`.
 2. Copy `docs/adr/0000-template.md` to `docs/adr/NNNN-<kebab-title>.md`.
 3. Fill every section. Keep it under one page:
    - **Context**: the forces and constraints, including what is out of scope.

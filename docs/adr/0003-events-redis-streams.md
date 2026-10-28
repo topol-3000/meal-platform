@@ -1,6 +1,6 @@
 # 0003. Long-running operations as events over Redis Streams, trace context in message fields
 
-- Status: Accepted (2026-10-25)
+- Status: Superseded by [0005](0005-http-between-services.md) (2026-10-28); accepted 2026-10-25
 - Deciders: Yevhenii
 
 ## Context

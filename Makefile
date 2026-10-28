@@ -1,8 +1,7 @@
 .DEFAULT_GOAL := help
-COMPOSE := docker compose
 OLLAMA_MODEL ?= $(shell grep -s '^OLLAMA_MODEL=' .env | cut -d= -f2)
 
-.PHONY: help env up down nuke ps logs models psql redis-cli check-telemetry lint
+.PHONY: help env up down ps logs db-add psql models check-telemetry lint
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-16s %s\n", $$1, $$2}'
@@ -10,36 +9,35 @@ help: ## Show this help
 env: ## Create .env from .env.example if missing
 	@test -f .env || cp .env.example .env
 
-up: env ## Start the platform (profiles from COMPOSE_PROFILES in .env)
-	$(COMPOSE) up -d --wait
+up: env ## Start the core and the profiles in .env (COMPOSE_PROFILES); returns when all are healthy
+	docker compose up --detach --wait
 	@echo "Grafana   http://localhost:3000"
-	@echo "Langfuse  http://localhost:3001  (if profile langfuse is on)"
+	@echo "Langfuse  http://localhost:3001  (profile langfuse)"
 	@echo "OTLP      http://localhost:4318"
 
-down: ## Stop containers, keep data
-	$(COMPOSE) down
+down: ## Stop and remove the containers (the volumes are kept)
+	docker compose down
 
-nuke: ## Stop containers and DELETE all volumes (databases, traces, models)
-	$(COMPOSE) down -v
+ps: ## Show the containers and their health
+	docker compose ps
 
-ps: ## Container status
-	$(COMPOSE) ps
+logs: ## Follow logs: make logs [s=postgres]
+	docker compose logs --follow $(s)
 
-logs: ## Follow logs, e.g. make logs s=lgtm
-	$(COMPOSE) logs -f $(s)
+db-add: ## Database and user for a service, safe to repeat: make db-add name=meal-recipes
+	@test -n "$(name)" || { echo "usage: make db-add name=meal-recipes"; exit 1; }
+	@scripts/db-add.sh "$(name)"
+
+psql: ## psql as the superuser: make psql [db=meal_recipes]
+	docker compose exec postgres psql -U postgres -d $(or $(db),postgres)
 
 models: ## Pull the Ollama model from .env (profile ai)
-	$(COMPOSE) exec ollama ollama pull $(OLLAMA_MODEL)
+	docker compose exec ollama ollama pull $(OLLAMA_MODEL)
 
-psql: ## psql into a service DB, e.g. make psql db=recipes
-	$(COMPOSE) exec postgres psql -U $(or $(db),postgres) $(or $(db),postgres)
+check-telemetry: ## Assert a service's traces, logs and metrics reached Grafana: make check-telemetry s=meal-recipes
+	@test -n "$(s)" || { echo "usage: make check-telemetry s=meal-recipes"; exit 1; }
+	@scripts/check-telemetry.sh "$(s)"
 
-redis-cli: ## redis-cli on the event bus
-	$(COMPOSE) exec redis redis-cli
-
-check-telemetry: ## Assert a service's traces/logs/metrics reached Grafana, e.g. make check-telemetry s=meal-recipes
-	./scripts/check-telemetry.sh $(s)
-
-lint: ## Validate compose files and schemas
-	$(COMPOSE) -f compose.yaml -f compose.gpu.yaml --profile ai --profile langfuse config --quiet
+lint: ## Validate the compose files and the JSON contracts
+	docker compose -f compose.yaml -f compose.gpu.yaml --profile ai --profile langfuse config --quiet
 	python3 -c "import json,pathlib; [json.loads(p.read_text()) for p in pathlib.Path('contracts').rglob('*.json')]"

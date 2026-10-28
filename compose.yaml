@@ -1,15 +1,12 @@
-# FamilyMeal local platform.
-#   make up        core: Postgres, Redis, Grafana LGTM (+ profiles from COMPOSE_PROFILES in .env)
-#   Profiles:  ai        -> Ollama
-#              langfuse  -> Langfuse (web, worker, ClickHouse, MinIO, Redis)
-# All containers share the `meal-platform` network so services started from their own
-# repos (`make docker-run`) can reach `postgres`, `redis`, `lgtm`, `ollama` by name.
-
+# FamilyMeal local platform: `make up` / `make down` (see README.md).
+#   Core:     Grafana LGTM, PostgreSQL, Valkey
+#   Profiles: ai       -> Ollama
+#             langfuse -> Langfuse (web, worker, ClickHouse, MinIO, Redis)
+#   switched on by COMPOSE_PROFILES in .env.
+# Ports are published on 127.0.0.1 only: nothing here has real credentials.
+# Services generated from meal-service-template expect these names, ports and images;
+# change them together with the template (POSTGRES_IMAGE / VALKEY_IMAGE in tests/conftest.py).
 name: meal-platform
-
-networks:
-  default:
-    name: meal-platform
 
 x-healthcheck: &healthcheck
   interval: 5s
@@ -18,56 +15,51 @@ x-healthcheck: &healthcheck
 
 services:
   # ---------------------------------------------------------------- core ----
-  postgres:
-    image: postgres:17
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-      # One database and one owner role per service (DB per service).
-      SERVICE_DATABASES: ${SERVICE_DATABASES:-recipes,planner,shopping,langfuse}
-      TZ: UTC
-      PGTZ: UTC
-    ports:
-      - 127.0.0.1:5432:5432
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./postgres/init:/docker-entrypoint-initdb.d:ro
-    healthcheck:
-      <<: *healthcheck
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
-
-  redis:
-    # Event bus (Redis Streams) and cache. Streams must never be evicted.
-    image: redis:8
-    restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
-    ports:
-      - 127.0.0.1:6379:6379
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      <<: *healthcheck
-      test: ["CMD", "redis-cli", "ping"]
-
+  # Grafana with Tempo, Loki and Prometheus (datasource uids `tempo`, `loki`, `prometheus`)
+  # behind an OpenTelemetry Collector. Telemetry is not persisted: `make down` clears it.
   lgtm:
-    # Grafana + OTel Collector + Tempo (traces) + Loki (logs) + Prometheus (metrics)
-    # + Pyroscope (profiles), preconfigured. Dev/test only.
-    image: grafana/otel-lgtm:0.38.0
-    restart: unless-stopped
-    environment:
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    image: grafana/otel-lgtm:0.38.1
     ports:
-      - 127.0.0.1:3000:3000 # Grafana UI
-      - 127.0.0.1:4317:4317 # OTLP gRPC
-      - 127.0.0.1:4318:4318 # OTLP HTTP
-    volumes:
-      - lgtm_data:/data
+      - "127.0.0.1:3000:3000" # Grafana
+      - "127.0.0.1:4317:4317" # OTLP gRPC
+      - "127.0.0.1:4318:4318" # OTLP HTTP
     healthcheck:
-      <<: *healthcheck
-      test: ["CMD-SHELL", "curl -sf http://localhost:3000/api/health && curl -so /dev/null http://localhost:4318/"]
+      # The image's own check, polled every 2 s while starting so `make up` returns sooner.
+      test: ["CMD", "/otel-lgtm/docker/healthcheck.sh"]
+      interval: 30s
+      start_period: 120s
+      start_interval: 2s
+
+  # One server for every service, a database and a user per service (`make db-add`).
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      # PostgreSQL 18 images keep data in /var/lib/postgresql/18/docker. The volume name has
+      # the major version, so a volume of another major version is never mounted here.
+      - postgres18_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "postgres"]
+      interval: 10s
       start_period: 30s
+      start_interval: 1s
+
+  # Cache for services rendered with `with_cache`. Not persisted: a cache may start empty.
+  valkey:
+    image: valkey/valkey:9
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      start_period: 30s
+      start_interval: 1s
+
+  # Services join here (docs/adding-a-service.md), each with a `<service>-migrate` job.
 
   # ----------------------------------------------------------- profile: ai ----
   ollama:
@@ -87,19 +79,36 @@ services:
 
   # ----------------------------------------------------- profile: langfuse ----
   # Mirrors upstream https://github.com/langfuse/langfuse/blob/main/docker-compose.yml
-  # but reuses our Postgres and listens on :3001 (Grafana has :3000).
+  # but reuses our PostgreSQL and listens on :3001 (Grafana has :3000).
+
+  # Langfuse's user and database in the shared PostgreSQL, like `make db-add` does for a
+  # service. Runs on every start and leaves what exists alone, so it works on an old volume.
+  langfuse-db:
+    image: postgres:18-alpine
+    profiles: [langfuse]
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      PGHOST: postgres
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: postgres
+    volumes:
+      - ./postgres/langfuse-db.sql:/langfuse-db.sql:ro
+    entrypoint: ["psql", "-v", "ON_ERROR_STOP=1", "--quiet", "-f", "/langfuse-db.sql"]
+
   langfuse-worker:
     image: langfuse/langfuse-worker:4
     profiles: [langfuse]
     restart: unless-stopped
     depends_on: &langfuse-depends-on
-      postgres: { condition: service_healthy }
+      langfuse-db: { condition: service_completed_successfully }
       langfuse-minio: { condition: service_healthy }
       langfuse-redis: { condition: service_healthy }
       langfuse-clickhouse: { condition: service_healthy }
     environment: &langfuse-env
       NEXTAUTH_URL: http://localhost:3001
-      DATABASE_URL: postgresql://langfuse:langfuse@postgres:5432/langfuse # role from postgres/init
+      DATABASE_URL: postgresql://langfuse:langfuse@postgres:5432/langfuse # from langfuse-db
       SALT: ${LANGFUSE_SALT:-local-dev-salt}
       ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
       TELEMETRY_ENABLED: "false"
@@ -167,6 +176,8 @@ services:
       test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
 
   langfuse-minio:
+    # Chainguard publishes only `latest` for free, so this is the one image without a
+    # version tag (upstream Langfuse compose uses the same).
     image: cgr.dev/chainguard/minio
     profiles: [langfuse]
     restart: unless-stopped
@@ -194,10 +205,13 @@ services:
       <<: *healthcheck
       test: ["CMD", "redis-cli", "-a", "${LANGFUSE_REDIS_PASSWORD:-langfuseredis}", "ping"]
 
+networks:
+  default:
+    # A fixed name, so `docker run --network meal-platform` reaches `lgtm`, `postgres`, `valkey`.
+    name: meal-platform
+
 volumes:
-  postgres_data:
-  redis_data:
-  lgtm_data:
+  postgres18_data:
   ollama_data:
   langfuse_clickhouse_data:
   langfuse_clickhouse_logs:
