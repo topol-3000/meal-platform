@@ -26,5 +26,6 @@ accepted, superseded by NNNN). An accepted ADR is not rewritten: a new one super
 | [0014](0014-optional-valkey-cache-with-redis-py.md) | Optional cache: Valkey through redis-py | Accepted |
 | [0015](0015-migrations-as-a-one-off-job.md) | Database migrations run as a one-off job from the service image | Accepted |
 | [0016](0016-local-postgresql.md) | Local PostgreSQL 18: one server, a database and a user per service | Accepted |
+| [0017](0017-no-license-scanning.md) | No license scanning | Accepted |
 
 New ADR: see the `write-adr` skill, template in [0000-template.md](0000-template.md).
