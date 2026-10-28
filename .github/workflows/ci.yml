@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compose files and JSON contracts are valid
+        run: make lint
+      - name: Shell scripts
+        run: shellcheck scripts/*.sh
+
+  core-stack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Start the core (no GPU, no profiles)
+        run: |
+          cp .env.example .env
+          sed -i 's/^COMPOSE_PROFILES=.*/COMPOSE_PROFILES=/; s/^COMPOSE_FILE=.*/COMPOSE_FILE=compose.yaml/' .env
+          make up
+      - name: make db-add creates a database only its user may open, and is safe to repeat
+        run: |
+          make db-add name=meal-recipes
+          make db-add name=meal-recipes
+          make db-add name=meal-planner
+          docker compose exec -T postgres psql -U meal_recipes -d meal_recipes -c 'select 1'
+          if docker compose exec -T postgres psql -U meal_planner -d meal_recipes -c 'select 1'; then
+            echo "meal_planner could connect to meal_recipes"; exit 1
+          fi
+          if make db-add name=recipes; then
+            echo "a name without the meal- prefix was accepted"; exit 1
+          fi
+      - name: Valkey answers
+        run: test "$(docker compose exec -T valkey valkey-cli ping)" = PONG
+      - if: failure()
+        run: docker compose logs
+
+  langfuse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Start the core and Langfuse (no GPU, no Ollama)
+        run: |
+          cp .env.example .env
+          sed -i 's/^COMPOSE_PROFILES=.*/COMPOSE_PROFILES=langfuse/; s/^COMPOSE_FILE=.*/COMPOSE_FILE=compose.yaml/' .env
+          make up
+      - name: Langfuse is up
+        run: curl --fail --silent --show-error --retry 30 --retry-delay 5 --retry-all-errors http://localhost:3001/api/public/health
+      - name: The langfuse-db job is safe to repeat
+        run: docker compose run --rm langfuse-db
+      - if: failure()
+        run: docker compose logs
